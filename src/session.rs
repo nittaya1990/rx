@@ -1,3 +1,4 @@
+#![allow(clippy::needless_collect)]
 ///! Session
 use crate::autocomplete::FileCompleter;
 use crate::brush::*;
@@ -11,7 +12,6 @@ use crate::hashmap;
 use crate::palette::*;
 use crate::platform::{self, InputState, Key, KeyboardInput, LogicalSize, ModifiersState};
 use crate::util;
-use crate::view::layer::{LayerCoords, LayerId};
 use crate::view::path;
 use crate::view::resource::ViewResource;
 use crate::view::{
@@ -19,10 +19,10 @@ use crate::view::{
     ViewState,
 };
 
-use rgx::kit::shape2d::{Fill, Rotation, Shape, Stroke};
-use rgx::kit::{Rgba8, ZDepth};
-use rgx::math::*;
-use rgx::rect::Rect;
+use crate::gfx::math::*;
+use crate::gfx::rect::Rect;
+use crate::gfx::shape2d::{Fill, Rotation, Shape, Stroke};
+use crate::gfx::{Point, Rgb8, Rgba8, ZDepth};
 
 use arrayvec::ArrayVec;
 
@@ -35,7 +35,8 @@ use std::fmt;
 use std::fs::File;
 use std::io;
 use std::io::Write;
-use std::ops::{Add, Deref, Sub};
+
+use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::time;
 
@@ -54,31 +55,6 @@ grid/color        #000000..#ffffff   Grid color
 grid/spacing      <x> <y>            Grid spacing
 "#;
 
-/// An RGB 8-bit color. Used when the alpha value isn't used.
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct Rgb8 {
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-impl From<Rgba8> for Rgb8 {
-    fn from(rgba: Rgba8) -> Self {
-        Self {
-            r: rgba.r,
-            g: rgba.g,
-            b: rgba.b,
-        }
-    }
-}
-
-impl fmt::Display for Rgb8 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "#{:02X}{:02X}{:02X}", self.r, self.g, self.b)
-    }
-}
-
 #[derive(Copy, Clone, Debug)]
 enum InternalCommand {
     StopRecording,
@@ -86,42 +62,7 @@ enum InternalCommand {
 
 /// Session coordinates.
 /// Encompasses anything within the window, such as the cursor position.
-#[derive(Copy, Clone, PartialEq, Debug)]
-pub struct SessionCoords(Point2<f32>);
-
-impl SessionCoords {
-    pub fn new(x: f32, y: f32) -> Self {
-        Self(Point2::new(x, y))
-    }
-
-    pub fn floor(&mut self) -> Self {
-        Self(self.0.map(f32::floor))
-    }
-}
-
-impl Deref for SessionCoords {
-    type Target = Point2<f32>;
-
-    fn deref(&self) -> &Point2<f32> {
-        &self.0
-    }
-}
-
-impl Add<Vector2<f32>> for SessionCoords {
-    type Output = Self;
-
-    fn add(self, vec: Vector2<f32>) -> Self {
-        SessionCoords(self.0 + vec)
-    }
-}
-
-impl Sub<Vector2<f32>> for SessionCoords {
-    type Output = Self;
-
-    fn sub(self, vec: Vector2<f32>) -> Self {
-        SessionCoords(self.0 - vec)
-    }
-}
+pub type SessionCoords = Point<Session, f32>;
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -246,8 +187,6 @@ pub enum Effect {
     ViewOps(ViewId, Vec<ViewOp>),
     /// When a view requires re-drawing.
     ViewDamaged(ViewId, Option<ViewExtent>),
-    /// When a view layer requires re-drawing.
-    ViewLayerDamaged(ViewId, LayerId),
     /// When the active view is non-permanently painted on.
     ViewPaintDraft(Vec<Shape>),
     /// When the active view is painted on.
@@ -503,23 +442,12 @@ impl KeyBinding {
 }
 
 /// Manages a list of key bindings.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct KeyBindings {
     elems: Vec<KeyBinding>,
 }
 
-impl Default for KeyBindings {
-    fn default() -> Self {
-        KeyBindings { elems: vec![] }
-    }
-}
-
 impl KeyBindings {
-    /// Create an empty set of key bindings.
-    pub fn new() -> Self {
-        Self { elems: Vec::new() }
-    }
-
     /// Add a key binding.
     pub fn add(&mut self, binding: KeyBinding) {
         for mode in binding.modes.iter() {
@@ -633,8 +561,7 @@ impl std::ops::Index<&str> for Settings {
     type Output = Value;
 
     fn index(&self, setting: &str) -> &Self::Output {
-        &self
-            .get(setting)
+        self.get(setting)
             .expect(&format!("setting {} should exist", setting))
     }
 }
@@ -665,7 +592,7 @@ pub struct Session {
     /// The color under the cursor, if any.
     pub hover_color: Option<Rgba8>,
     /// The view under the cursor, if any.
-    pub hover_view: Option<(ViewId, LayerId)>,
+    pub hover_view: Option<ViewId>,
 
     /// The workspace offset. Views are offset by this vector.
     pub offset: Vector2<f32>,
@@ -936,7 +863,7 @@ impl Session {
                 let end = recording.iter().position(|t| t.frame != frame);
 
                 recording
-                    .drain(..end.unwrap_or_else(|| recording.len()))
+                    .drain(..end.unwrap_or(recording.len()))
                     .collect::<Vec<TimedEvent>>()
                     .into_iter()
                     .for_each(|t| self.handle_event(t.event, exec));
@@ -1050,12 +977,9 @@ impl Session {
                         .push(Effect::ViewOps(v.id, v.ops.drain(..).collect()));
                 }
                 match v.state {
-                    ViewState::Dirty(_) | ViewState::LayerDirty(_) => {}
+                    ViewState::Dirty(_) => {}
                     ViewState::Damaged(extent) => {
                         self.effects.push(Effect::ViewDamaged(v.id, extent));
-                    }
-                    ViewState::LayerDamaged(layer) => {
-                        self.effects.push(Effect::ViewLayerDamaged(v.id, layer));
                     }
                     ViewState::Okay => {}
                 }
@@ -1206,17 +1130,17 @@ impl Session {
 
         for v in self.views.iter_mut() {
             let p = cursor - self.offset;
-            if let Some(l) = v.contains(p) {
-                self.hover_view = Some((v.id, l));
+            if v.contains(p) {
+                self.hover_view = Some(v.id);
                 break;
             }
         }
 
         self.hover_color = if self.palette.hover.is_some() {
             self.palette.hover
-        } else if let Some((v, l)) = self.hover_view {
-            let p: LayerCoords<u32> = self.layer_coords(v, l, cursor).into();
-            self.view(v).color_at(l, p).cloned()
+        } else if let Some(v) = self.hover_view {
+            let p = self.view_coords(v, cursor).into();
+            self.view(v).color_at(p).cloned()
         } else {
             None
         };
@@ -1390,18 +1314,6 @@ impl Session {
         self.views.active_id == id
     }
 
-    /// Activate the currently hovered layer, if in the active view.
-    pub fn activate_hover_layer(&mut self) {
-        let active_id = self.views.active_id;
-
-        match self.hover_view {
-            Some((view_id, layer_id)) if view_id == active_id => {
-                self.view_mut(active_id).activate_layer(layer_id);
-            }
-            _ => {}
-        }
-    }
-
     /// Convert "logical" window coordinates to session coordinates.
     pub fn window_to_session_coords(&self, position: platform::LogicalPosition) -> SessionCoords {
         let (x, y) = (position.x, position.y);
@@ -1413,9 +1325,9 @@ impl Session {
     }
 
     /// Convert session coordinates to view coordinates of the given view.
-    pub fn view_coords(&self, v: ViewId, p: SessionCoords) -> ViewCoords<f32> {
+    pub fn view_coords(&self, v: ViewId, p: SessionCoords) -> Point<ViewExtent, f32> {
         let v = self.view(v);
-        let SessionCoords(mut p) = p;
+        let SessionCoords { point: mut p, .. } = p;
 
         p = p - self.offset - v.offset;
         p = p / v.zoom;
@@ -1427,11 +1339,11 @@ impl Session {
             p.y = v.height() as f32 - p.y;
         }
 
-        ViewCoords::new(p.x.floor(), p.y.floor())
+        Point::new(p.x.floor(), p.y.floor())
     }
 
     /// Convert view coordinates to session coordinates.
-    pub fn session_coords(&self, v: ViewId, p: ViewCoords<f32>) -> SessionCoords {
+    pub fn session_coords(&self, v: ViewId, p: Point<ViewExtent, f32>) -> SessionCoords {
         let v = self.view(v);
 
         let p = Point2::new(p.x * v.zoom, p.y * v.zoom);
@@ -1448,35 +1360,12 @@ impl Session {
     }
 
     /// Convert session coordinates to view coordinates of the active view.
-    pub fn active_view_coords(&self, p: SessionCoords) -> ViewCoords<f32> {
+    pub fn active_view_coords(&self, p: SessionCoords) -> Point<ViewExtent, f32> {
         self.view_coords(self.views.active_id, p)
     }
 
-    pub fn layer_coords(&self, v: ViewId, l: LayerId, p: SessionCoords) -> LayerCoords<f32> {
-        let v = self.view(v);
-        let SessionCoords(p) = p;
-
-        let p = p - self.offset - v.offset - v.layer_offset(l, v.zoom);
-        let mut p = p / v.zoom;
-
-        if v.flip_x {
-            p.x = v.width() as f32 - p.x;
-        }
-        if v.flip_y {
-            p.y = v.height() as f32 - p.y;
-        }
-
-        LayerCoords::new(p.x.floor(), p.y.floor())
-    }
-
-    /// Convert session coordinates to layer coordinates of the active layer.
-    pub fn active_layer_coords(&self, p: SessionCoords) -> LayerCoords<f32> {
-        let v = self.active_view();
-        self.layer_coords(v.id, v.active_layer_id, p)
-    }
-
     /// Check whether a point is inside the selection, if any.
-    pub fn is_selected(&self, p: LayerCoords<i32>) -> bool {
+    pub fn is_selected(&self, p: ViewCoords<i32>) -> bool {
         if let Some(s) = self.selection {
             s.abs().bounds().contains(*p)
         } else {
@@ -1641,14 +1530,8 @@ impl Session {
 
     /// Private ///////////////////////////////////////////////////////////////////
 
-    /// Export a layer in a specific format.
-    fn export_layer_as(
-        &mut self,
-        id: ViewId,
-        layer_id: LayerId,
-        path: &Path,
-        scale: u32,
-    ) -> io::Result<()> {
+    /// Export a view in a specific format.
+    fn export_as(&mut self, id: ViewId, path: &Path, scale: u32) -> io::Result<()> {
         let ext = path.extension().ok_or_else(|| {
             io::Error::new(io::ErrorKind::Other, "file path requires an extension")
         })?;
@@ -1662,10 +1545,10 @@ impl Session {
                 let view = self.view(id);
                 let delay = time::Duration::from_millis(self.settings["animation/delay"].to_u64());
 
-                view.save_gif(layer_id, &path, delay, &palette, scale)?
+                view.save_gif(&path, delay, &palette, scale)?
             }
-            "svg" => self.view(id).save_svg(layer_id, &path, scale)?,
-            "png" => self.view(id).save_png(layer_id, &path, scale)?,
+            "svg" => self.view(id).save_svg(&path, scale)?,
+            "png" => self.view(id).save_png(&path, scale)?,
             _ => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -1712,29 +1595,6 @@ impl Session {
                     format!("\"{}\" {} pixels read", path.display(), width * height),
                     MessageType::Info,
                 );
-            }
-            view::Format::Archive => {
-                let archive = crate::io::load_archive(&*path)?;
-                let extent = archive.manifest.extent;
-                let mut layers = archive.layers.into_iter();
-
-                let frames = layers.next().expect("there is at least one layer");
-                let view_id = self.add_view(
-                    FileStatus::Saved(FileStorage::Single((*path).into())),
-                    extent.fw,
-                    extent.fh,
-                    frames,
-                );
-
-                for layer in layers {
-                    let pixels = util::stitch_frames(
-                        layer,
-                        extent.fw as usize,
-                        extent.fh as usize,
-                        Rgba8::TRANSPARENT,
-                    );
-                    self.view_mut(view_id).add_layer(Some(pixels));
-                }
             }
             view::Format::Gif => {
                 return Err(io::Error::new(
@@ -1837,12 +1697,7 @@ impl Session {
         let mut offset = first.height() as f32 * first.zoom + Self::VIEW_MARGIN;
 
         for v in self.views.iter_mut().skip(1) {
-            if v.layers.len() > 1 {
-                // Account for layer composite.
-                offset += v.fh as f32 * v.zoom;
-            }
             v.offset.y = offset;
-
             offset += v.height() as f32 * v.zoom + Self::VIEW_MARGIN;
         }
         self.cursor_dirty();
@@ -2015,19 +1870,15 @@ impl Session {
                 }
 
                 // Click on a view.
-                if let Some((id, layer_id)) = self.hover_view {
+                if let Some(id) = self.hover_view {
                     // Clicking on a view is one way to get out of command mode.
                     if self.mode == Mode::Command {
                         self.cmdline_hide();
                         return;
                     }
                     if self.is_active(id) {
-                        {
-                            let v = self.view_mut(id);
-                            v.activate_layer(layer_id);
-                        }
                         let v = self.view(id);
-                        let p = self.active_layer_coords(self.cursor);
+                        let p = self.active_view_coords(self.cursor);
 
                         let extent = v.extent();
 
@@ -2050,7 +1901,7 @@ impl Session {
                                     let filler = FloodFiller::new(self.active_view(), p, self.fg);
                                     if let Some(shapes) = filler.and_then(|f| f.run()) {
                                         self.effects.push(Effect::ViewPaintFinal(shapes));
-                                        self.active_view_mut().touch_layer();
+                                        self.active_view_mut().touch();
                                     }
                                     debug!("flood fill in: {:?}", start_time.elapsed());
                                 }
@@ -2103,7 +1954,7 @@ impl Session {
                         match self.brush.state {
                             BrushState::Drawing { .. } | BrushState::DrawStarted { .. } => {
                                 self.brush.stop_drawing();
-                                self.active_view_mut().touch_layer();
+                                self.active_view_mut().touch();
                             }
                             _ => {}
                         }
@@ -2117,7 +1968,7 @@ impl Session {
 
     fn handle_mouse_wheel(&mut self, delta: platform::LogicalDelta) {
         if delta.y > 0. {
-            if let Some((v, _)) = self.hover_view {
+            if let Some(v) = self.hover_view {
                 self.activate(v);
             }
             self.zoom_in(self.cursor);
@@ -2132,9 +1983,9 @@ impl Session {
         }
 
         let prev_cursor = self.cursor;
-        let p = self.active_layer_coords(cursor);
-        let prev_p = self.active_layer_coords(prev_cursor);
-        let (vw, vh) = self.active_view().layer_size();
+        let p = self.active_view_coords(cursor);
+        let prev_p = self.active_view_coords(prev_cursor);
+        let (vw, vh) = self.active_view().size();
 
         self.cursor = cursor;
         self.cursor_dirty();
@@ -2151,8 +2002,9 @@ impl Session {
                     Mode::Normal => match self.tool {
                         Tool::Brush if p != prev_p => match self.brush.state {
                             BrushState::DrawStarted { .. } | BrushState::Drawing { .. } => {
-                                let mut p: LayerCoords<i32> = p.into();
                                 let brush = &mut self.brush;
+                                let mut p: ViewCoords<i32> = p.into();
+
                                 if brush.is_set(BrushMode::Multi) {
                                     p.clamp(Rect::new(
                                         (brush.size / 2) as i32,
@@ -2163,7 +2015,7 @@ impl Session {
                                 }
                                 brush.draw(p);
                             }
-                            _ => self.activate_hover_layer(),
+                            _ => {}
                         },
                         _ => {}
                     },
@@ -2192,7 +2044,6 @@ impl Session {
                         }
                     }
                     Mode::Visual(VisualState::Pasting) => {
-                        self.activate_hover_layer();
                         self.center_selection(cursor);
                     }
                     _ => {}
@@ -2436,7 +2287,7 @@ impl Session {
 
     /// Center the selection to the given session coordinates.
     fn center_selection(&mut self, p: SessionCoords) {
-        let c = self.active_layer_coords(p);
+        let c = self.active_view_coords(p);
         if let Some(ref mut s) = self.selection {
             let r = s.abs().bounds();
             let (w, h) = (r.width(), r.height());
@@ -2672,7 +2523,7 @@ impl Session {
                         .views
                         .get(v.id)
                         .expect(&format!("view #{} must exist", v.id))
-                        .layer(v.active_layer_id)
+                        .layer
                         .current_snapshot();
 
                     for pixel in pixels.iter().cloned() {
@@ -2687,7 +2538,7 @@ impl Session {
             Command::PaletteWrite(path) => match File::create(&path) {
                 Ok(mut f) => {
                     for color in self.palette.colors.iter() {
-                        writeln!(&mut f, "{}", color.to_string()).ok();
+                        writeln!(&mut f, "{}", color).ok();
                     }
                     self.message(
                         format!(
@@ -2705,16 +2556,12 @@ impl Session {
             Command::Zoom(op) => {
                 let center = if let Some(s) = self.selection {
                     let v = self.active_view();
-                    let coords = s.bounds().center().map(|n| n as f32)
-                        + v.layer_offset(v.active_layer_id, 1.);
+                    let coords = s.bounds().center().map(|n| n as f32);
                     self.session_coords(v.id, coords.into())
                 } else if self.hover_view.is_some() {
                     self.cursor
                 } else {
-                    self.session_coords(
-                        self.views.active_id,
-                        self.active_view().active_layer_center(),
-                    )
+                    self.session_coords(self.views.active_id, self.active_view().center())
                 };
 
                 match op {
@@ -2799,20 +2646,6 @@ impl Session {
                 self.active_view_mut().shrink();
                 self.check_selection();
             }
-            Command::LayerAdd => {
-                self.active_view_mut().add_layer(None);
-                self.organize_views();
-            }
-            Command::LayerRemove(id) => {
-                if let Some(id) = id {
-                    self.active_view_mut().remove_layer(id);
-                    self.check_selection();
-                    self.organize_views();
-                } else {
-                    unimplemented!()
-                }
-            }
-            Command::LayerExtend(_id) => unimplemented!(),
             Command::Slice(None) => {
                 let v = self.active_view_mut();
                 v.slice(1);
@@ -2918,19 +2751,10 @@ impl Session {
             }
             Command::Export(scale, path) => {
                 let view = self.active_view();
-                let active_layer_id = view.active_layer_id;
-                let nlayers = view.layers.len();
                 let id = view.id;
                 let scale = scale.unwrap_or(view.zoom as u32);
 
-                if nlayers > 1 {
-                    self.message(
-                        format!("Error: the `export` command only works with a single layer"),
-                        MessageType::Error,
-                    );
-                } else if let Err(e) =
-                    self.export_layer_as(id, active_layer_id, Path::new(&path), scale)
-                {
+                if let Err(e) = self.export_as(id, Path::new(&path), scale) {
                     self.message(format!("Error: {}", e), MessageType::Error);
                 }
             }
@@ -3028,31 +2852,8 @@ impl Session {
                 self.unimplemented();
             }
             Command::SelectionMove(x, y) => {
-                let extent = self.active_view().extent();
-
                 if let Some(ref mut s) = self.selection {
                     s.translate(x, y);
-
-                    let rect = s.bounds();
-                    let v = self
-                        .views
-                        .active_mut()
-                        .expect("there is always an active view");
-
-                    if y > 0 && rect.max().y > extent.height() as i32 {
-                        if v.activate_next_layer() {
-                            *s = Selection::new(rect.x1, 0, rect.x2, rect.height());
-                        }
-                    } else if y < 0 && rect.min().y < 0 {
-                        if v.activate_prev_layer() {
-                            *s = Selection::new(
-                                rect.x1,
-                                extent.height() as i32 - rect.height(),
-                                rect.x2,
-                                extent.height() as i32,
-                            );
-                        }
-                    }
                 }
             }
             Command::SelectionResize(x, y) => {
@@ -3098,7 +2899,7 @@ impl Session {
                         y = 0;
                     }
                     *s = Selection::from(s.bounds().expand(x, y, x, y));
-                } else if let Some((id, _)) = self.hover_view {
+                } else if let Some(id) = self.hover_view {
                     if id == self.views.active_id {
                         let p = self.active_view_coords(self.cursor).map(|n| n as i32);
                         self.selection = Some(Selection::new(p.x, p.y, p.x + 1, p.y + 1));
@@ -3172,7 +2973,7 @@ impl Session {
                             Stroke::NONE,
                             Fill::Solid(color.unwrap_or(self.fg).into()),
                         )]));
-                    self.active_view_mut().touch_layer();
+                    self.active_view_mut().touch();
                 }
             }
             Command::SelectionErase => {
@@ -3187,7 +2988,7 @@ impl Session {
                             Fill::Solid(Rgba8::TRANSPARENT.into()),
                         )]),
                     ]);
-                    self.active_view_mut().touch_layer();
+                    self.active_view_mut().touch();
                 }
             }
             Command::PaintColor(rgba, x, y) => {
@@ -3296,7 +3097,7 @@ mod test {
 
     #[test]
     fn test_key_bindings() {
-        let mut kbs = KeyBindings::new();
+        let mut kbs = KeyBindings::default();
         let state = InputState::Pressed;
         let modifiers = Default::default();
 
@@ -3314,7 +3115,7 @@ mod test {
             ..kb1.clone()
         };
 
-        kbs.add(kb1.clone());
+        kbs.add(kb1);
         kbs.add(kb2.clone());
 
         assert_eq!(
@@ -3349,7 +3150,7 @@ mod test {
             state: InputState::Pressed,
         };
 
-        let mut kbs = KeyBindings::new();
+        let mut kbs = KeyBindings::default();
         kbs.add(kb.clone());
 
         assert_eq!(

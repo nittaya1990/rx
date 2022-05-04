@@ -1,6 +1,5 @@
-use rgx::kit::sprite2d;
-use rgx::kit::{Repeat, Rgba8, ZDepth};
-use rgx::rect::Rect;
+use crate::gfx::sprite2d;
+use crate::gfx::{Rect, Repeat, Rgba8, ZDepth};
 
 pub enum TextAlign {
     Left,
@@ -42,7 +41,7 @@ impl TextBatch {
             }
         }
 
-        for c in text.bytes().into_iter() {
+        for c in text.bytes() {
             let i: usize = c as usize - offset;
             let x: f32 = (i % 16) as f32 * gw;
             let y: f32 = (i / 16) as f32 * gh;

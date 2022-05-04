@@ -1,4 +1,5 @@
 use crate::event::TimedEvent;
+use crate::gfx::Rgba8;
 use crate::util;
 
 use std::collections::VecDeque;
@@ -10,7 +11,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time;
 
-use rgx::color::Rgba8;
 use seahash::SeaHasher;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -423,8 +423,6 @@ impl GifRecorder {
     }
 
     fn finish(&mut self) -> io::Result<()> {
-        use std::convert::TryInto;
-
         if let Some(encoder) = &mut self.encoder {
             for (i, (t1, gif_data)) in self.frames.iter().enumerate() {
                 let delay = if let Some((t2, _)) = self.frames.get(i + 1) {

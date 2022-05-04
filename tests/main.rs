@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde_derive::Deserialize;
-use toml;
 
 #[macro_use]
 extern crate lazy_static;
@@ -116,21 +115,6 @@ fn visual_mouse() {
 }
 
 #[test]
-fn layers() {
-    test("layers");
-}
-
-#[test]
-fn layers_snapshots() {
-    test("layers-snapshots");
-}
-
-#[test]
-fn archive() {
-    test("archive");
-}
-
-#[test]
 fn organize_views() {
     test("organize-views");
 }
@@ -147,7 +131,6 @@ fn run(name: &str) -> io::Result<()> {
     // We allow tests to create these temporary files,
     // so make sure it's not there when a test is run.
     fs::remove_file("/tmp/rx.png").ok();
-    fs::remove_file("/tmp/archive.rxa").ok();
 
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")

@@ -7,16 +7,12 @@ use crate::renderer;
 use crate::session::{self, Blending, Effect, Session};
 use crate::sprite;
 use crate::util;
-use crate::view::layer::{FrameRange, LayerId};
 use crate::view::resource::ViewResource;
 use crate::view::{View, ViewId, ViewOp, ViewState};
 use crate::{data, data::Assets, image};
 
-use nonempty::NonEmpty;
-
-use rgx::kit::{self, shape2d, sprite2d, Origin, Rgba, Rgba8, ZDepth};
-use rgx::math::{Matrix4, Vector2};
-use rgx::rect::Rect;
+use crate::gfx::{shape2d, sprite2d, Origin, Rgba, Rgba8, ZDepth};
+use crate::gfx::{Matrix4, Rect, Repeat, Vector2};
 
 use luminance::context::GraphicsContext;
 use luminance::depth_test::DepthComparison;
@@ -176,7 +172,7 @@ impl LayerData {
             ZDepth::default(),
             Rgba::TRANSPARENT,
             1.,
-            kit::Repeat::default(),
+            Repeat::default(),
         );
 
         let verts: Vec<Sprite2dVertex> = batch
@@ -240,12 +236,10 @@ impl LayerData {
 }
 
 struct ViewData {
-    layers: NonEmpty<LayerData>,
+    layer: LayerData,
     staging_fb: Framebuffer<Backend, Dim2, pixel::SRGBA8UI, pixel::Depth32F>,
     anim_tess: Option<Tess<Backend, Sprite2dVertex>>,
     layer_tess: Option<Tess<Backend, Sprite2dVertex>>,
-    w: u32,
-    h: u32,
 }
 
 impl ViewData {
@@ -259,44 +253,11 @@ impl ViewData {
             .unwrap();
 
         Self {
-            layers: NonEmpty::new(LayerData::new(w, h, pixels, ctx)),
+            layer: LayerData::new(w, h, pixels, ctx),
             staging_fb,
             anim_tess: None,
             layer_tess: None,
-            w,
-            h,
         }
-    }
-
-    fn layer_pixels(&mut self) -> impl Iterator<Item = (LayerId, Vec<Rgba8>)> + '_ {
-        self.layers
-            .iter_mut()
-            .enumerate()
-            .map(|(i, l)| (i, l.pixels()))
-    }
-
-    fn get_layer(&self, index: usize) -> &LayerData {
-        self.layers
-            .get(index)
-            .unwrap_or_else(|| panic!("layer #{} must exist", index))
-    }
-
-    fn get_layer_mut(&mut self, index: usize) -> &mut LayerData {
-        self.layers
-            .get_mut(index)
-            .unwrap_or_else(|| panic!("layer #{} must exist", index))
-    }
-
-    fn add_layer(
-        &mut self,
-        _range: &FrameRange,
-        pixels: Option<&[Rgba8]>,
-        ctx: &mut Context,
-    ) -> LayerId {
-        let layer = LayerData::new(self.w, self.h, pixels, ctx);
-        self.layers.push(layer);
-
-        self.layers.len() - 1
     }
 }
 
@@ -522,7 +483,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         self.update_view_composites(session);
 
         let [screen_w, screen_h] = self.screen_fb.size();
-        let ortho: M44 = kit::ortho(screen_w, screen_h, Origin::TopLeft).into();
+        let ortho: M44 = Matrix4::ortho(screen_w, screen_h, Origin::TopLeft).into();
         let identity: M44 = Matrix4::identity().into();
 
         let Self {
@@ -547,7 +508,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         } = self;
 
         draw_ctx.clear();
-        draw_ctx.draw(&session, avg_frametime, execution);
+        draw_ctx.draw(session, avg_frametime, execution);
 
         let text_tess = self
             .ctx
@@ -618,17 +579,16 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             .views
             .active()
             .expect("there must always be an active view");
-        let l = v.active_layer_id;
         let v_data = view_data.get(&v.id).unwrap();
-        let l_data = v_data.get_layer(l);
-        let view_ortho = kit::ortho(v.width(), v.fh, Origin::TopLeft);
+        let l_data = &v_data.layer;
+        let view_ortho = Matrix4::ortho(v.width(), v.fh, Origin::TopLeft);
 
         let mut builder = self.ctx.new_pipeline_gate();
 
         // Render to view staging buffer.
         builder.pipeline::<PipelineError, _, _, _, _>(
             &v_data.staging_fb,
-            &pipeline_st,
+            pipeline_st,
             |pipeline, mut shd_gate| {
                 // Render staged brush strokes.
                 if let Some(tess) = staging_tess {
@@ -707,7 +667,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
             .set_clear_color([bg.r, bg.g, bg.b, bg.a]);
         builder.pipeline::<PipelineError, _, _, _, _>(
             screen_fb,
-            &screen_st,
+            screen_st,
             |pipeline, mut shd_gate| {
                 // Draw view checkers to screen framebuffer.
                 if session.settings["checker"].is_set() {
@@ -726,43 +686,38 @@ impl<'a> renderer::Renderer<'a> for Renderer {
 
                 for (id, v) in view_data.iter_mut() {
                     if let Some(view) = session.views.get(*id) {
-                        let staging_texture = v.staging_fb.color_slot();
+                        let transform =
+                            Matrix4::from_translation(
+                                (session.offset + view.offset).extend(*draw::VIEW_LAYER),
+                            ) * Matrix4::from_nonuniform_scale(view.zoom, view.zoom, 1.0);
 
-                        for (layer_id, l) in v.layers.iter_mut().enumerate() {
-                            let layer_offset = view.layer_offset(layer_id, view.zoom);
-                            let transform =
-                                Matrix4::from_translation(
-                                    (session.offset + view.offset + layer_offset)
-                                        .extend(*draw::VIEW_LAYER),
-                                ) * Matrix4::from_nonuniform_scale(view.zoom, view.zoom, 1.0);
+                        // Render views.
+                        shd_gate.shade(sprite2d, |mut iface, uni, mut rdr_gate| {
+                            let bound_view = pipeline
+                                .bind_texture(v.layer.fb.color_slot())
+                                .expect("binding textures never fails");
 
-                            // Render views.
-                            shd_gate.shade(sprite2d, |mut iface, uni, mut rdr_gate| {
-                                let bound_view = pipeline
-                                    .bind_texture(l.fb.color_slot())
-                                    .expect("binding textures never fails");
+                            iface.set(&uni.ortho, ortho);
+                            iface.set(&uni.transform, transform.into());
+                            iface.set(&uni.tex, bound_view.binding());
 
-                                iface.set(&uni.ortho, ortho);
-                                iface.set(&uni.transform, transform.into());
-                                iface.set(&uni.tex, bound_view.binding());
-
-                                rdr_gate
-                                    .render(render_st, |mut tess_gate| tess_gate.render(&l.tess))?;
-
-                                if layer_id == view.active_layer_id {
-                                    // TODO: We only need to render this on the active view.
-                                    let bound_view_staging = pipeline
-                                        .bind_texture(staging_texture)
-                                        .expect("binding textures never fails");
-
-                                    iface.set(&uni.tex, bound_view_staging.binding());
-                                    rdr_gate.render(render_st, |mut tess_gate| {
-                                        tess_gate.render(&l.tess)
-                                    })?;
-                                }
-                                Ok(())
+                            rdr_gate.render(render_st, |mut tess_gate| {
+                                tess_gate.render(&v.layer.tess)
                             })?;
-                        }
+
+                            // TODO: We only need to render this on the active view.
+                            let staging_texture = v.staging_fb.color_slot();
+                            let bound_view_staging = pipeline
+                                .bind_texture(staging_texture)
+                                .expect("binding textures never fails");
+
+                            iface.set(&uni.tex, bound_view_staging.binding());
+                            rdr_gate.render(render_st, |mut tess_gate| {
+                                tess_gate.render(&v.layer.tess)
+                            })?;
+
+                            Ok(())
+                        })?;
                     }
                 }
 
@@ -779,63 +734,24 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                     iface.set(&uni.ortho, ortho);
                     iface.set(&uni.transform, identity);
 
-                    // Render view composites.
-                    for (id, v) in view_data.iter_mut() {
-                        match (&v.layer_tess, session.views.get(*id)) {
-                            (Some(tess), Some(view)) if view.layers.len() > 1 => {
-                                for l in v.layers.iter_mut() {
-                                    let bound_view = pipeline
-                                        .bind_texture(l.fb.color_slot())
-                                        .expect("binding textures never fails");
-
-                                    iface.set(&uni.tex, bound_view.binding());
-
-                                    rdr_gate.render(render_st, |mut tess_gate| {
-                                        tess_gate.render(tess)
-                                    })?;
-                                }
-                            }
-                            _ => (),
-                        }
-                    }
-
                     // Render view animations.
                     if session.settings["animation"].is_set() {
                         for (id, v) in view_data.iter_mut() {
                             match (&v.anim_tess, session.views.get(*id)) {
                                 (Some(tess), Some(view)) if view.animation.len() > 1 => {
-                                    let composite_t = Matrix4::from_translation(
-                                        Vector2::new(0., -(v.h as f32 * view.zoom)).extend(0.),
+                                    let bound_layer = pipeline
+                                        .bind_texture(v.layer.fb.color_slot())
+                                        .expect("binding textures never fails");
+                                    let t = Matrix4::from_translation(
+                                        Vector2::new(0., view.zoom).extend(0.),
                                     );
 
-                                    for (i, l) in v.layers.iter_mut().enumerate() {
-                                        // TODO: Assert that this layer is actually registered in the
-                                        // view manager.
-
-                                        let bound_layer = pipeline
-                                            .bind_texture(l.fb.color_slot())
-                                            .expect("binding textures never fails");
-                                        let layer_offset = v.h as usize * i;
-                                        let t = Matrix4::from_translation(
-                                            Vector2::new(0., layer_offset as f32 * view.zoom)
-                                                .extend(0.),
-                                        );
-
-                                        // Render layer animation.
-                                        iface.set(&uni.tex, bound_layer.binding());
-                                        iface.set(&uni.transform, t.into());
-                                        rdr_gate.render(render_st, |mut tess_gate| {
-                                            tess_gate.render(tess)
-                                        })?;
-
-                                        // Render composite animation.
-                                        if view.layers.len() > 1 {
-                                            iface.set(&uni.transform, composite_t.into());
-                                            rdr_gate.render(render_st, |mut tess_gate| {
-                                                tess_gate.render(tess)
-                                            })?;
-                                        }
-                                    }
+                                    // Render layer animation.
+                                    iface.set(&uni.tex, bound_layer.binding());
+                                    iface.set(&uni.transform, t.into());
+                                    rdr_gate.render(render_st, |mut tess_gate| {
+                                        tess_gate.render(tess)
+                                    })?;
                                 }
                                 _ => (),
                             }
@@ -888,7 +804,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
         // Render to back buffer.
         builder.pipeline::<PipelineError, _, _, _, _>(
             present_fb,
-            &pipeline_st,
+            pipeline_st,
             |pipeline, mut shd_gate| {
                 // Render screen framebuffer.
                 let bound_screen = pipeline
@@ -909,7 +825,7 @@ impl<'a> renderer::Renderer<'a> for Renderer {
                         iface.set(&uni.tex, bound_font.binding());
                         iface.set(
                             &uni.ortho,
-                            kit::ortho(screen_w, screen_h, Origin::BottomLeft).into(),
+                            Matrix4::ortho(screen_w, screen_h, Origin::BottomLeft).into(),
                         );
 
                         rdr_gate.render(render_st, |mut tess_gate| tess_gate.render(&overlay_tess))
@@ -947,16 +863,12 @@ impl<'a> renderer::Renderer<'a> for Renderer {
 
                 match state {
                     ViewState::Dirty(_) if is_resized => {
-                        vr.record_view_resized(v_data.layer_pixels().collect(), extent);
+                        vr.record_view_resized(v_data.layer.pixels(), extent);
                     }
                     ViewState::Dirty(_) => {
-                        vr.record_view_painted(v_data.layer_pixels().collect());
+                        vr.record_view_painted(v_data.layer.pixels());
                     }
-                    ViewState::LayerDirty(layer_id) => {
-                        let pixels = v_data.get_layer_mut(layer_id).pixels();
-                        vr.record_layer_painted(layer_id, pixels, extent);
-                    }
-                    ViewState::Okay | ViewState::Damaged(_) | ViewState::LayerDamaged(_) => {}
+                    ViewState::Okay | ViewState::Damaged(_) => {}
                 }
             }
         }
@@ -1024,13 +936,11 @@ impl Renderer {
                 Effect::ViewActivated(_) => {}
                 Effect::ViewAdded(id) => {
                     // FIXME: This should be done when the view is added in the ViewManager.
-                    if let Some((s, pixels)) =
-                        session.views.get_snapshot_safe(id, LayerId::default())
-                    {
+                    if let Some((s, pixels)) = session.views.get_snapshot_safe(id) {
                         let (w, h) = (s.width(), s.height());
 
                         self.view_data
-                            .insert(id, ViewData::new(w, h, Some(&pixels), &mut self.ctx));
+                            .insert(id, ViewData::new(w, h, Some(pixels), &mut self.ctx));
                     }
                 }
                 Effect::ViewRemoved(id) => {
@@ -1044,9 +954,6 @@ impl Renderer {
                 }
                 Effect::ViewDamaged(id, None) => {
                     self.handle_view_damaged(session.view(id))?;
-                }
-                Effect::ViewLayerDamaged(id, layer) => {
-                    self.handle_view_layer_damaged(session.view(id), layer)?;
                 }
                 Effect::ViewBlendingChanged(blending) => {
                     self.blending = blending;
@@ -1073,28 +980,19 @@ impl Renderer {
         for op in ops {
             match op {
                 ViewOp::Resize(w, h) => {
-                    self.resize_view(&v, *w, *h)?;
+                    self.resize_view(v, *w, *h)?;
                 }
-                ViewOp::AddLayer(layer_id, range) => {
-                    if let Some((_, pixels)) = v.current_snapshot(*layer_id) {
-                        self.view_data
-                            .get_mut(&v.id)
-                            .expect("views must have associated view data")
-                            .add_layer(range, Some(pixels), &mut self.ctx);
-                    }
-                }
-                ViewOp::RemoveLayer(_layer_id) => {}
                 ViewOp::Clear(color) => {
                     let view = self
                         .view_data
                         .get_mut(&v.id)
                         .expect("views must have associated view data");
 
-                    for l in view.layers.iter_mut() {
-                        l.fb.color_slot()
-                            .clear(GenMipmaps::No, (color.r, color.g, color.b, color.a))
-                            .map_err(Error::Texture)?;
-                    }
+                    view.layer
+                        .fb
+                        .color_slot()
+                        .clear(GenMipmaps::No, (color.r, color.g, color.b, color.a))
+                        .map_err(Error::Texture)?;
                 }
                 ViewOp::Blit(src, dst) => {
                     let view = self
@@ -1102,28 +1000,22 @@ impl Renderer {
                         .get_mut(&v.id)
                         .expect("views must have associated view data");
 
-                    for (l_id, l) in view.layers.iter_mut().enumerate() {
-                        let (_, texels) = v
-                            .layer(l_id)
-                            .get_snapshot_rect(&src.map(|n| n as i32))
-                            .unwrap(); // TODO: Handle this nicely?
-                        let texels = util::align_u8(&texels);
+                    let (_, texels) = v.layer.get_snapshot_rect(&src.map(|n| n as i32)).unwrap(); // TODO: Handle this nicely?
+                    let texels = util::align_u8(&texels);
 
-                        l.fb.color_slot()
-                            .upload_part_raw(
-                                GenMipmaps::No,
-                                [dst.x1 as u32, dst.y1 as u32],
-                                [src.width() as u32, src.height() as u32],
-                                &texels,
-                            )
-                            .map_err(Error::Texture)?;
-                    }
+                    view.layer
+                        .fb
+                        .color_slot()
+                        .upload_part_raw(
+                            GenMipmaps::No,
+                            [dst.x1 as u32, dst.y1 as u32],
+                            [src.width() as u32, src.height() as u32],
+                            texels,
+                        )
+                        .map_err(Error::Texture)?;
                 }
-                ViewOp::Yank(layer_id, src) => {
-                    let (_, pixels) = v
-                        .layer(*layer_id)
-                        .get_snapshot_rect(&src.map(|n| n as i32))
-                        .unwrap(); // TODO: Handle this nicely?
+                ViewOp::Yank(src) => {
+                    let (_, pixels) = v.layer.get_snapshot_rect(&src.map(|n| n as i32)).unwrap();
                     let (w, h) = (src.width() as u32, src.height() as u32);
                     let [paste_w, paste_h] = self.paste.size();
 
@@ -1138,11 +1030,9 @@ impl Renderer {
                         .upload_raw(GenMipmaps::No, body)
                         .map_err(Error::Texture)?;
                 }
-                ViewOp::Flip(layer_id, src, dir) => {
-                    let (_, mut pixels) = v
-                        .layer(*layer_id)
-                        .get_snapshot_rect(&src.map(|n| n as i32))
-                        .unwrap(); // TODO: Handle this nicely?
+                ViewOp::Flip(src, dir) => {
+                    let (_, mut pixels) =
+                        v.layer.get_snapshot_rect(&src.map(|n| n as i32)).unwrap();
                     let (w, h) = (src.width() as u32, src.height() as u32);
                     let [paste_w, paste_h] = self.paste.size();
 
@@ -1187,7 +1077,7 @@ impl Renderer {
                         ZDepth::default(),
                         Rgba::TRANSPARENT,
                         1.,
-                        kit::Repeat::default(),
+                        Repeat::default(),
                     );
 
                     self.paste_outputs.push(
@@ -1195,12 +1085,12 @@ impl Renderer {
                             .tessellation::<_, Sprite2dVertex>(batch.vertices().as_slice()),
                     );
                 }
-                ViewOp::SetPixel(layer_id, rgba, x, y) => {
+                ViewOp::SetPixel(rgba, x, y) => {
                     let fb = &mut self
                         .view_data
                         .get_mut(&v.id)
                         .expect("views must have associated view data")
-                        .get_layer_mut(*layer_id)
+                        .layer
                         .fb;
                     let texels = &[*rgba];
                     let texels = util::align_u8(texels);
@@ -1213,38 +1103,17 @@ impl Renderer {
         Ok(())
     }
 
-    fn handle_view_layer_damaged(
-        &mut self,
-        view: &View<ViewResource>,
-        layer_id: LayerId,
-    ) -> Result<(), RendererError> {
-        let layer = self
+    fn handle_view_damaged(&mut self, view: &View<ViewResource>) -> Result<(), RendererError> {
+        let layer = &mut self
             .view_data
             .get_mut(&view.id)
             .expect("views must have associated view data")
-            .get_layer_mut(layer_id);
+            .layer;
 
-        let (_, pixels) = view
-            .current_snapshot(layer_id)
-            .expect(&format!("view #{} has a current snapshot", view.id));
+        let (_, pixels) = view.layer.current_snapshot();
 
         layer.clear()?;
         layer.upload(util::align_u8(pixels))?;
-
-        Ok(())
-    }
-
-    fn handle_view_damaged(&mut self, view: &View<ViewResource>) -> Result<(), RendererError> {
-        let n = self
-            .view_data
-            .get(&view.id)
-            .expect("views must have associated view data")
-            .layers
-            .len();
-
-        for layer_id in 0..n {
-            self.handle_view_layer_damaged(view, layer_id)?;
-        }
 
         Ok(())
     }
@@ -1275,29 +1144,19 @@ impl Renderer {
         let th = u32::min(eh, vh);
 
         let mut view_data = ViewData::new(vw, vh, None, &mut self.ctx);
-        let view_resource = &view.resource;
-
-        // Create n-1 layers, since layer #0 is created when a `ViewData` is created.
-        for _ in view_resource.layers().skip(1) {
-            view_data.add_layer(&FrameRange::default(), None, &mut self.ctx);
-        }
-
         let trect = Rect::origin(tw as i32, th as i32);
-        for (layer_id, layer) in view_resource.layers() {
-            // The following sequence of commands will try to copy a rect that isn't contained
-            // in the snapshot, hence we must skip the uploading in that case:
-            //
-            //     :f/add
-            //     :f/remove
-            //     :l/add
-            //     :undo
-            //
-            if let Some((_, texels)) = layer.get_snapshot_rect(&trect) {
-                let texels = util::align_u8(&texels);
-                let l = view_data.get_layer_mut(*layer_id);
+        // The following sequence of commands will try to copy a rect that isn't contained
+        // in the snapshot, hence we must skip the uploading in that case:
+        //
+        //     :f/add
+        //     :f/remove
+        //     :undo
+        //
+        if let Some((_, texels)) = view.layer.get_snapshot_rect(&trect) {
+            let texels = util::align_u8(&texels);
+            let l = &mut view_data.layer;
 
-                l.upload_part([0, vh - th], [tw, th], texels)?;
-            }
+            l.upload_part([0, vh - th], [tw, th], texels)?;
         }
 
         self.view_data.insert(view.id, view_data);
@@ -1313,7 +1172,7 @@ impl Renderer {
         for v in s.views.iter() {
             // FIXME: When `v.animation.val()` doesn't change, we don't need
             // to re-create the buffer.
-            let batch = draw::draw_view_animation(s, &v);
+            let batch = draw::draw_view_animation(s, v);
 
             if let Some(vd) = self.view_data.get_mut(&v.id) {
                 vd.anim_tess = Some(
@@ -1326,7 +1185,7 @@ impl Renderer {
 
     fn update_view_composites(&mut self, s: &Session) {
         for v in s.views.iter() {
-            let batch = draw::draw_view_composites(s, &v);
+            let batch = draw::draw_view_composites(s, v);
 
             if let Some(vd) = self.view_data.get_mut(&v.id) {
                 vd.layer_tess = Some(
